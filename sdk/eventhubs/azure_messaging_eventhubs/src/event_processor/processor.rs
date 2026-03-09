@@ -50,6 +50,7 @@ pub struct EventProcessor {
     next_partition_client_sender: Sender<Arc<PartitionClient>>,
     client_details: ConsumerClientDetails,
     prefetch: u32,
+    owner_level: Option<i64>,
     update_interval: Duration,
     start_positions: StartPositions,
     is_running: std::sync::Mutex<bool>,
@@ -62,6 +63,7 @@ struct EventProcessorOptions {
     update_interval: Duration,
     start_positions: StartPositions,
     prefetch: u32,
+    owner_level: Option<i64>,
     partition_ids: Vec<String>,
 }
 
@@ -163,6 +165,7 @@ impl EventProcessor {
             ))),
             client_details,
             prefetch: options.prefetch,
+            owner_level: options.owner_level,
             update_interval: options.update_interval,
             start_positions: options.start_positions,
             next_partition_client_sender: sender,
@@ -366,6 +369,7 @@ impl EventProcessor {
                 Some(OpenReceiverOptions {
                     start_position: Some(start_position),
                     prefetch: Some(self.prefetch),
+                    owner_level: self.owner_level,
                     ..Default::default()
                 }),
             )
@@ -564,6 +568,7 @@ pub mod builders {
         start_positions: Option<StartPositions>,
         max_partition_count: Option<usize>,
         prefetch: Option<u32>,
+        owner_level: Option<i64>,
         load_balancing_strategy: Option<super::ProcessorStrategy>,
         partition_expiration_duration: Option<Duration>,
     }
@@ -611,6 +616,17 @@ pub mod builders {
             self
         }
 
+        /// Sets the owner level (epoch) for partition receivers.
+        ///
+        /// When set, the Event Hub broker enforces exclusive access: a receiver
+        /// with a higher owner level will forcibly disconnect any existing receiver
+        /// with a lower (or no) owner level on the same partition and consumer group.
+        /// This prevents duplicate processing during partition rebalancing.
+        pub fn with_owner_level(mut self, owner_level: i64) -> Self {
+            self.owner_level = Some(owner_level);
+            self
+        }
+
         /// Sets the partition expiration duration for the event processor.
         pub fn with_partition_expiration_duration(
             mut self,
@@ -647,6 +663,7 @@ pub mod builders {
                     update_interval: self.update_interval.unwrap_or(DEFAULT_UPDATE_INTERVAL),
                     start_positions: self.start_positions.unwrap_or_default(),
                     prefetch: self.prefetch.unwrap_or(DEFAULT_PREFETCH),
+                    owner_level: self.owner_level,
                     partition_ids: eh_properties.partition_ids,
                 },
             )
