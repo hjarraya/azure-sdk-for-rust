@@ -1,45 +1,31 @@
 # Copyright (c) Microsoft Corp. All Rights Reserved.
 # Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
-# cspell:ignore appender
-
 [package]
 name = "azure_messaging_eventhubs_checkpointstore_blob"
 version = "0.5.0"
 description = "Azure Event Hubs checkpoint store implementation using Azure Blob Storage"
 readme = "README.md"
-license.workspace = true
-repository.workspace = true
+license = "MIT"
+repository = "https://github.com/azure/azure-sdk-for-rust"
 homepage = "https://github.com/azure/azure-sdk-for-rust"
-authors.workspace = true
+authors = ["Microsoft"]
 keywords = ["sdk", "azure", "messaging", "cloud", "eventhubs"]
 categories = ["api-bindings"]
 documentation = "https://docs.rs/azure_messaging_eventhubs_checkpointstore_blob"
-edition.workspace = true
-rust-version.workspace = true
+edition = "2024"
 
 [dependencies]
-async-trait.workspace = true
-azure_core.workspace = true
-azure_messaging_eventhubs.workspace = true
-azure_storage_blob.workspace = true
-futures.workspace = true
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
-time = { workspace = true, features = ["serde"] }
-tracing = { workspace = true }
-uuid = { workspace = true, features = ["v4", "serde"] }
-
-[dev-dependencies]
-azure_core_opentelemetry.workspace = true
-azure_core_test = { workspace = true, features = ["tracing"] }
-azure_identity.workspace = true
-opentelemetry.workspace = true
-opentelemetry-appender-tracing = { version = "0.30" }
-opentelemetry-stdout = { version = "0.30" }
-opentelemetry_sdk.workspace = true
-tokio.workspace = true
-tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+async-trait = "0.1"
+azure_core = "0.32.0"
+azure_messaging_eventhubs = { path = "../azure_messaging_eventhubs", version = "0.11.0" }
+azure_storage_blob = "0.9.0"
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+time = { version = "0.3.41", features = ["serde"] }
+tracing = "0.1.40"
+uuid = { version = "1.18", features = ["v4", "serde"] }
 
 [features]
 default = ["azure_core/default"]
