@@ -125,6 +125,38 @@ impl ProcessorConsumersMap {
         info!("Consumers for partition now: {:?}", consumers.keys());
         Ok(())
     }
+
+    /// Returns the set of partition IDs that have active partition clients.
+    fn get_active_partition_ids(&self) -> Result<Vec<String>> {
+        let consumers = self
+            .consumers
+            .lock()
+            .map_err(|_| EventHubsError::with_message("Could not lock consumers mutex."))?;
+        Ok(consumers.keys().cloned().collect())
+    }
+
+    /// Revokes and removes partition clients for partitions that are no longer
+    /// owned by this processor instance.
+    ///
+    /// This is called during dispatch when the load balancer indicates that
+    /// a partition has been reassigned to another consumer. The partition client
+    /// is marked as revoked (so the consumer can detect it via `is_revoked()`)
+    /// and removed from the consumers map (so a new client can be created if the
+    /// partition is later reassigned back).
+    fn revoke_partition_clients(&self, partition_ids: &[String]) -> Result<()> {
+        let mut consumers = self
+            .consumers
+            .lock()
+            .map_err(|_| EventHubsError::with_message("Could not lock consumers mutex."))?;
+        for partition_id in partition_ids {
+            if let Some(weak) = consumers.remove(partition_id) {
+                if let Some(client) = weak.upgrade() {
+                    client.revoke();
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 //pub(crate) type ConsumersType = std::sync::Mutex<HashMap<String, Arc<PartitionClient>>>;
@@ -295,6 +327,25 @@ impl EventProcessor {
             error!("Error in load balancing: {:?}", e);
             e
         })?;
+
+        // Detect partitions that were stolen by another consumer.
+        // Compare the set of partitions we currently own (from load_balance)
+        // against active partition clients. Revoke any clients for partitions
+        // we no longer own so they stop processing.
+        let owned_ids: std::collections::HashSet<&str> =
+            ownerships.iter().map(|o| o.partition_id.as_str()).collect();
+        let active_ids = consumers.get_active_partition_ids()?;
+        let stolen: Vec<String> = active_ids
+            .into_iter()
+            .filter(|id| !owned_ids.contains(id.as_str()))
+            .collect();
+        if !stolen.is_empty() {
+            info!(
+                "Partitions no longer owned, revoking: {}",
+                stolen.join(", ")
+            );
+            consumers.revoke_partition_clients(&stolen)?;
+        }
 
         let checkpoints = self.get_checkpoint_map().await;
         let checkpoints = checkpoints.map_err(|e| {
