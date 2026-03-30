@@ -6,7 +6,7 @@ use crate::{
     error::Result,
     models::{Checkpoint, ConsumerClientDetails, ReceivedEventData},
     processor::CheckpointStore,
-    EventHubsError, EventReceiver,
+    ConsumerClient, EventHubsError, EventReceiver,
 };
 use azure_core_amqp::{message::AmqpAnnotationKey, AmqpValue};
 use futures::Stream;
@@ -28,6 +28,11 @@ pub struct PartitionClient {
     checkpoint_store: Arc<dyn CheckpointStore + Send + Sync>,
     client_details: ConsumerClientDetails,
     event_receiver: OnceLock<EventReceiver>,
+    /// Per-partition AMQP connection. When set, this partition has its own
+    /// isolated connection (matching C#/Java SDK behavior). The connection is
+    /// dropped when this `PartitionClient` is dropped or closed, ensuring
+    /// clean resource cleanup on revocation.
+    consumer_client: OnceLock<ConsumerClient>,
     consumers: Weak<ProcessorConsumersMap>,
     revoked: Arc<AtomicBool>,
 }
@@ -48,6 +53,7 @@ impl PartitionClient {
             checkpoint_store,
             client_details,
             event_receiver: OnceLock::new(),
+            consumer_client: OnceLock::new(),
             consumers,
             revoked: Arc::new(AtomicBool::new(false)),
         }
@@ -209,6 +215,13 @@ impl PartitionClient {
             ))
         })?;
         Ok(())
+    }
+
+    /// Stores a per-partition `ConsumerClient` that owns the AMQP connection
+    /// for this partition. The connection is kept alive as long as this
+    /// `PartitionClient` exists and is dropped on close/drop.
+    pub(crate) fn set_consumer_client(&self, client: ConsumerClient) {
+        let _ = self.consumer_client.set(client);
     }
 }
 

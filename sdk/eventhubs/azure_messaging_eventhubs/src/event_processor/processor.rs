@@ -9,8 +9,8 @@ use super::{
     CheckpointStore, ProcessorStrategy,
 };
 use crate::{
-    error::Result, models::ConsumerClientDetails, ConsumerClient, EventHubsError,
-    OpenReceiverOptions, StartLocation, StartPosition,
+    error::Result, models::ConsumerClientDetails, ConsumerClient, ConsumerClientFactory,
+    EventHubsError, OpenReceiverOptions, StartLocation, StartPosition,
 };
 //use async_io::Timer;
 use async_lock::Mutex as AsyncMutex;
@@ -45,7 +45,15 @@ use tracing::{debug, error, info};
 pub struct EventProcessor {
     checkpoint_store: Arc<dyn CheckpointStore + Send + Sync>,
     load_balancer: Arc<AsyncMutex<LoadBalancer>>,
+    /// Management client used for listing partitions, checkpoints, and load
+    /// balancing. NOT used for receiving events (each partition gets its own
+    /// connection via `client_factory`).
     consumer_client: ConsumerClient,
+    /// Factory that creates per-partition `ConsumerClient` instances, each with
+    /// its own AMQP connection. This matches the C#/Java SDK pattern where
+    /// epoch-based link stealing only disconnects the stolen partition's
+    /// connection instead of all partitions sharing one connection.
+    client_factory: Option<ConsumerClientFactory>,
     next_partition_clients: AsyncMutex<Receiver<Arc<PartitionClient>>>,
     next_partition_client_sender: Sender<Arc<PartitionClient>>,
     client_details: ConsumerClientDetails,
@@ -176,6 +184,7 @@ impl EventProcessor {
 
     fn new(
         consumer_client: ConsumerClient,
+        client_factory: Option<ConsumerClientFactory>,
         checkpoint_store: Arc<dyn CheckpointStore + Send + Sync>,
         options: EventProcessorOptions,
     ) -> Result<Arc<Self>> {
@@ -186,6 +195,7 @@ impl EventProcessor {
         Ok(Arc::new(EventProcessor {
             checkpoint_store: checkpoint_store.clone(),
             consumer_client,
+            client_factory,
 
             // Default to Balanced strategy if not provided
             load_balancer: Arc::new(AsyncMutex::new(LoadBalancer::new(
@@ -407,14 +417,35 @@ impl EventProcessor {
             ));
         }
 
-        // Since we can only have a single EventReceiver on a partition, we don't actually attempt to create the receiver until
         let start_position = self.get_start_position(&partition_id, checkpoints);
         debug!(
             "Start position for partition {}: {:?}",
             partition_id, start_position
         );
-        let receiver = self
-            .consumer_client
+
+        // Create a per-partition ConsumerClient with its own AMQP connection
+        // if a factory is available. This isolates each partition's AMQP traffic
+        // so that epoch-based link stealing only disconnects the stolen
+        // partition, not all partitions on this pod.
+        // Falls back to the shared consumer_client when no factory is set
+        // (backward compatible).
+        let per_partition_client = if let Some(factory) = &self.client_factory {
+            let client = factory.create()?;
+            client.ensure_connection().await?;
+            debug!(
+                "Created per-partition AMQP connection for partition {}",
+                partition_id
+            );
+            Some(client)
+        } else {
+            None
+        };
+
+        let consumer = per_partition_client
+            .as_ref()
+            .unwrap_or(&self.consumer_client);
+
+        let receiver = consumer
             .open_receiver_on_partition(
                 partition_id.clone(),
                 Some(OpenReceiverOptions {
@@ -429,9 +460,20 @@ impl EventProcessor {
             error!("Error opening receiver for partition client: {:?}", e);
             return Err(e);
         }
-        info!("Receiver opened for partition client: {:?}", &partition_id);
+        info!(
+            "Receiver opened for partition client: {:?} (isolated connection: {})",
+            &partition_id,
+            per_partition_client.is_some()
+        );
         let receiver = receiver.unwrap();
         partition_client.set_event_receiver(receiver)?;
+
+        // Transfer ownership of the per-partition client to the PartitionClient
+        // so the AMQP connection is kept alive as long as the partition is owned
+        // and dropped when the partition is revoked.
+        if let Some(client) = per_partition_client {
+            partition_client.set_consumer_client(client);
+        }
 
         info!("Adding partition client to queue.");
 
@@ -576,7 +618,10 @@ impl EventProcessor {
 
 pub mod builders {
     use super::{CheckpointStore, EventProcessor};
-    use crate::{error::Result, event_processor::models::StartPositions, ConsumerClient};
+    use crate::{
+        error::Result, event_processor::models::StartPositions, ConsumerClient,
+        ConsumerClientFactory,
+    };
     use azure_core::time::Duration;
     use std::sync::Arc;
 
@@ -688,10 +733,39 @@ pub mod builders {
         }
 
         /// Builds the event processor with the specified consumer client and checkpoint store.
-        /// Returns a `Result` containing the constructed `EventProcessor`.
+        ///
+        /// All partition receivers share the single `consumer_client` AMQP connection.
+        /// For per-partition connection isolation, use [`build_with_factory`](Self::build_with_factory).
         pub async fn build(
             self,
             consumer_client: ConsumerClient,
+            checkpoint_store: Arc<dyn CheckpointStore + Send + Sync>,
+        ) -> Result<Arc<EventProcessor>> {
+            self.build_inner(consumer_client, None, checkpoint_store)
+                .await
+        }
+
+        /// Builds the event processor with per-partition AMQP connection isolation.
+        ///
+        /// The `consumer_client` is used for management operations (listing
+        /// partitions, checkpoints, load balancing). Each partition receiver gets
+        /// its own AMQP connection created by the `client_factory`. This matches
+        /// the C#/Java SDK pattern and ensures epoch-based link stealing only
+        /// disconnects the stolen partition, not all partitions on this pod.
+        pub async fn build_with_factory(
+            self,
+            consumer_client: ConsumerClient,
+            client_factory: ConsumerClientFactory,
+            checkpoint_store: Arc<dyn CheckpointStore + Send + Sync>,
+        ) -> Result<Arc<EventProcessor>> {
+            self.build_inner(consumer_client, Some(client_factory), checkpoint_store)
+                .await
+        }
+
+        async fn build_inner(
+            self,
+            consumer_client: ConsumerClient,
+            client_factory: Option<ConsumerClientFactory>,
             checkpoint_store: Arc<dyn CheckpointStore + Send + Sync>,
         ) -> Result<Arc<EventProcessor>> {
             // Retrieve the set of partitions from the consumer client
@@ -703,6 +777,7 @@ pub mod builders {
 
             EventProcessor::new(
                 consumer_client,
+                client_factory,
                 checkpoint_store,
                 super::EventProcessorOptions {
                     strategy: self

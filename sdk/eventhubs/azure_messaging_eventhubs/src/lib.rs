@@ -19,7 +19,8 @@ mod producer;
 /// Types sent to and received from the Event Hubs service.
 pub mod models;
 pub use consumer::{
-    ConsumerClient, EventReceiver, OpenReceiverOptions, StartLocation, StartPosition,
+    ConsumerClient, ConsumerClientFactory, EventReceiver, OpenReceiverOptions, StartLocation,
+    StartPosition,
 };
 pub use producer::{
     batch::{EventDataBatch, EventDataBatchOptions},

@@ -27,6 +27,45 @@ use std::{
 };
 use tracing::{debug, trace};
 
+/// Factory for creating per-partition [`ConsumerClient`] instances.
+///
+/// The C# and Java EventHub SDKs create one AMQP connection per partition,
+/// so that epoch-based link stealing only disconnects the stolen partition's
+/// link instead of all partitions sharing a connection. This factory stores
+/// the credentials and configuration needed to create independent
+/// `ConsumerClient` instances on demand.
+pub struct ConsumerClientFactory {
+    fully_qualified_namespace: String,
+    eventhub_name: String,
+    consumer_group: Option<String>,
+    credential: Arc<dyn TokenCredential>,
+    application_id: Option<String>,
+    instance_id: Option<String>,
+    retry_options: Option<RetryOptions>,
+    custom_endpoint: Option<Url>,
+}
+
+impl ConsumerClientFactory {
+    /// Creates a new `ConsumerClient` with its own dedicated AMQP connection.
+    ///
+    /// Each call produces an independent client suitable for isolating one
+    /// partition's AMQP traffic from all others.
+    pub fn create(&self) -> Result<ConsumerClient> {
+        ConsumerClient::new(
+            &self.fully_qualified_namespace,
+            self.eventhub_name.clone(),
+            self.consumer_group.clone(),
+            self.credential.clone(),
+            ConsumerClientOptions {
+                application_id: self.application_id.clone(),
+                instance_id: self.instance_id.clone(),
+                retry_options: self.retry_options.clone(),
+                custom_endpoint: self.custom_endpoint.clone(),
+            },
+        )
+    }
+}
+
 /// A client that can be used to receive events from an Event Hub.
 pub struct ConsumerClient {
     recoverable_connection: Arc<RecoverableConnection>,
@@ -389,7 +428,7 @@ impl ConsumerClient {
         Ok(ManagementInstance::new(self.recoverable_connection.clone()))
     }
 
-    async fn ensure_connection(&self) -> azure_core_amqp::Result<()> {
+    pub(crate) async fn ensure_connection(&self) -> azure_core_amqp::Result<()> {
         self.recoverable_connection.ensure_connection().await?;
         Ok(())
     }
@@ -702,6 +741,46 @@ pub mod builders {
             )?;
             consumer.ensure_connection().await?;
             Ok(consumer)
+        }
+
+        /// Opens a connection and also returns a [`ConsumerClientFactory`] that
+        /// can create additional per-partition `ConsumerClient` instances, each
+        /// with its own AMQP connection.
+        pub async fn open_with_factory(
+            self,
+            fully_qualified_namespace: &str,
+            eventhub_name: String,
+            credential: Arc<dyn azure_core::credentials::TokenCredential>,
+        ) -> Result<(super::ConsumerClient, super::ConsumerClientFactory)> {
+            let custom_endpoint = match self.custom_endpoint {
+                Some(endpoint) => Some(Url::parse(&endpoint).map_err(azure_core::Error::from)?),
+                None => None,
+            };
+            let factory = super::ConsumerClientFactory {
+                fully_qualified_namespace: fully_qualified_namespace.to_string(),
+                eventhub_name: eventhub_name.clone(),
+                consumer_group: self.consumer_group.clone(),
+                credential: credential.clone(),
+                application_id: self.application_id.clone(),
+                instance_id: self.instance_id.clone(),
+                retry_options: self.retry_options.clone(),
+                custom_endpoint: custom_endpoint.clone(),
+            };
+            trace!("Opening consumer client on {fully_qualified_namespace}.");
+            let consumer = super::ConsumerClient::new(
+                fully_qualified_namespace,
+                eventhub_name,
+                self.consumer_group,
+                credential,
+                ConsumerClientOptions {
+                    application_id: self.application_id,
+                    instance_id: self.instance_id,
+                    retry_options: self.retry_options,
+                    custom_endpoint,
+                },
+            )?;
+            consumer.ensure_connection().await?;
+            Ok((consumer, factory))
         }
     }
 }
