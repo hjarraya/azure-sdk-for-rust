@@ -380,6 +380,18 @@ impl EventProcessor {
         checkpoints: &HashMap<String, Checkpoint>,
         consumers: Weak<ProcessorConsumersMap>,
     ) -> Result<()> {
+        // Guard against opening new AMQP receivers during the shutdown window.
+        // shutdown() sets is_running=false but does not interrupt a dispatch() call
+        // that is already in-flight. Without this check, a new PartitionClient (and
+        // its AMQP receiver) can be created just before run() checks is_shutdown()
+        // after its sleep — that receiver is never closed, leaving a zombie slot.
+        if self.is_shutdown()? {
+            debug!(
+                "add_partition_client: processor is shutting down, skipping partition {:?}",
+                partition_id
+            );
+            return Ok(());
+        }
         info!("Add partition client for partition ID: {:?}", partition_id);
 
         let partition_client = Arc::new(PartitionClient::new(
